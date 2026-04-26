@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import dotenv
 import streamlit as st
@@ -10,11 +11,27 @@ from my_agents.triage_agent import build_turn_triage_agent
 
 dotenv.load_dotenv()
 
+st.set_page_config(
+    page_title="Restaurant Bot",
+    layout="centered",
+)
+
 
 BLOCKED_INPUT_REPLY = (
     "저는 레스토랑 관련 질문에 대해서만 도와드리고 있어요. "
     "메뉴를 확인하거나, 예약하거나, 음식을 주문하거나, 서비스 불편을 접수할 수 있어요."
 )
+
+
+DISPLAY_AGENT_NAMES = {
+    "첫 안내": "첫 안내",
+    "menu_agent": "메뉴 안내 담당",
+    "order_agent": "주문 담당",
+    "reservation_agent": "예약 담당",
+    "complaints_agent": "불만 처리 담당",
+    "input_guardrail": "입력 가드레일",
+    "output_guardrail": "출력 가드레일",
+}
 
 
 HANDOFF_MESSAGES = {
@@ -45,6 +62,22 @@ if "ui_history" not in st.session_state:
     st.session_state["ui_history"] = []
 
 
+def get_display_agent_name(agent_name: str) -> str:
+    return DISPLAY_AGENT_NAMES.get(agent_name, agent_name)
+
+
+def ensure_openai_api_key() -> bool:
+    if os.getenv("OPENAI_API_KEY"):
+        return True
+
+    secret_key = st.secrets.get("OPENAI_API_KEY")
+    if secret_key:
+        os.environ["OPENAI_API_KEY"] = secret_key
+        return True
+
+    return False
+
+
 def paint_history():
     for message in st.session_state["ui_history"]:
         with st.chat_message(message["role"]):
@@ -52,35 +85,48 @@ def paint_history():
 
 
 def render_assistant_turn(
-    triage_line: str,
-    handoff_line: str,
-    specialist_response: str,
+    active_agent_name: str,
+    response_text: str,
+    routed_from: str | None = None,
+    handoff_line: str = "",
 ) -> str:
-    parts = []
-    if triage_line:
-        parts.append(triage_line)
+    parts = [f"**응답 담당:** `{get_display_agent_name(active_agent_name)}`"]
+
+    if routed_from and routed_from != active_agent_name:
+        parts.append(
+            f"**전달 경로:** `{get_display_agent_name(routed_from)}` -> `{get_display_agent_name(active_agent_name)}`"
+        )
+
     if handoff_line:
         parts.append(handoff_line)
-    if specialist_response:
-        parts.append(specialist_response)
+    if response_text:
+        parts.append(response_text)
     return "\n\n".join(parts)
 
 
 st.title("어서 오세요.")
 st.caption("메뉴 안내, 주문, 예약, 불만 접수를 도와드릴게요.")
 
+if not ensure_openai_api_key():
+    st.error("`OPENAI_API_KEY`가 설정되지 않았습니다.")
+    st.info(
+        "로컬에서는 `.streamlit/secrets.toml` 또는 환경변수에 `OPENAI_API_KEY`를 넣고, "
+        "Streamlit Cloud에서는 App settings > Secrets에 같은 값을 추가하세요."
+    )
+    st.stop()
+
 paint_history()
 
 
 async def run_agent(message: str):
-    with st.chat_message("ai"):
+    with st.chat_message("assistant"):
         assistant_placeholder = st.empty()
         direct_response = ""
-        triage_line = ""
         handoff_line = ""
         specialist_response = ""
         turn_triage_agent = build_turn_triage_agent(message)
-        current_agent_name = turn_triage_agent.name
+        triage_agent_name = turn_triage_agent.name
+        current_agent_name = triage_agent_name
         handoff_started = False
 
         try:
@@ -96,15 +142,19 @@ async def run_agent(message: str):
                         if handoff_started:
                             specialist_response += event.data.delta
                             content = render_assistant_turn(
-                                triage_line=triage_line,
+                                active_agent_name=current_agent_name,
+                                response_text=specialist_response,
+                                routed_from=triage_agent_name,
                                 handoff_line=handoff_line,
-                                specialist_response=specialist_response,
                             )
                             assistant_placeholder.markdown(content.replace("$", "\\$"))
                         else:
                             direct_response += event.data.delta
                             assistant_placeholder.markdown(
-                                direct_response.replace("$", "\\$")
+                                render_assistant_turn(
+                                    active_agent_name=current_agent_name,
+                                    response_text=direct_response,
+                                ).replace("$", "\\$")
                             )
                 elif event.type == "agent_updated_stream_event":
                     if current_agent_name != event.new_agent.name:
@@ -118,18 +168,21 @@ async def run_agent(message: str):
                             },
                         )
                         direct_response = ""
-                        triage_line = handoff_message["triage"]
                         handoff_line = handoff_message["ui"]
                         specialist_response = ""
                         content = render_assistant_turn(
-                            triage_line=triage_line,
+                            active_agent_name=current_agent_name,
+                            response_text="",
+                            routed_from=triage_agent_name,
                             handoff_line=handoff_line,
-                            specialist_response="",
                         )
                         assistant_placeholder.markdown(content)
         except InputGuardrailTripwireTriggered:
             result = await Runner.run(input_guardrail_agent, message, context=guest_context)
-            blocked_content = BLOCKED_INPUT_REPLY
+            blocked_content = render_assistant_turn(
+                active_agent_name="input_guardrail",
+                response_text=BLOCKED_INPUT_REPLY,
+            )
             with st.sidebar:
                 st.write(f"⛔ 입력 가드레일 차단: {result.final_output.reason}")
             assistant_placeholder.markdown(blocked_content)
@@ -138,7 +191,13 @@ async def run_agent(message: str):
             )
             return
         except OutputGuardrailTripwireTriggered:
-            blocked_content = "정중하고 안전한 안내만 드릴 수 있어요. 메뉴, 주문, 예약, 불만 처리와 관련된 요청으로 다시 말씀해 주세요."
+            blocked_content = render_assistant_turn(
+                active_agent_name="output_guardrail",
+                response_text=(
+                    "정중하고 안전한 안내만 드릴 수 있어요. 메뉴, 주문, 예약, "
+                    "불만 처리와 관련된 요청으로 다시 말씀해 주세요."
+                ),
+            )
             assistant_placeholder.markdown(blocked_content)
             st.session_state["ui_history"].append(
                 {"role": "assistant", "content": blocked_content}
@@ -147,12 +206,16 @@ async def run_agent(message: str):
 
         if handoff_started:
             final_content = render_assistant_turn(
-                triage_line=triage_line,
+                active_agent_name=current_agent_name,
+                response_text=specialist_response,
+                routed_from=triage_agent_name,
                 handoff_line=handoff_line,
-                specialist_response=specialist_response,
             )
         else:
-            final_content = direct_response
+            final_content = render_assistant_turn(
+                active_agent_name=current_agent_name,
+                response_text=direct_response,
+            )
 
         if final_content:
             st.session_state["ui_history"].append(
@@ -170,6 +233,10 @@ if message:
 
 
 with st.sidebar:
+    st.subheader("앱 상태")
+    st.caption("Handoff: 첫 안내 -> 메뉴 / 주문 / 예약 / 불만 처리")
+    st.caption("Secrets: `OPENAI_API_KEY` 필요")
+
     st.subheader("대화 메모리")
     reset = st.button("Reset memory")
     if reset:
