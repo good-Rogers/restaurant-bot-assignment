@@ -113,6 +113,42 @@ def allergy_safe_suggestions(
 
 
 @function_tool
+def dietary_menu_suggestions(context: RestaurantContext, dietary_preference: str) -> str:
+    preference_key = dietary_preference.lower().strip()
+    preference_aliases = {
+        "채식": "vegetarian",
+        "채식주의": "vegetarian",
+        "vegetarian": "vegetarian",
+        "비건": "vegan",
+        "vegan": "vegan",
+        "글루텐프리": "gluten-free",
+        "글루텐 프리": "gluten-free",
+        "gluten-free": "gluten-free",
+    }
+    normalized = preference_aliases.get(preference_key, preference_key)
+
+    safe_items = []
+    for dish, info in MENU_DATA.items():
+        tags = [tag.lower() for tag in info["tags"]]
+
+        if normalized == "vegetarian":
+            if "vegetarian" not in tags:
+                continue
+        elif normalized:
+            if normalized not in tags:
+                continue
+
+        safe_items.append(
+            f"- {dish.title()} ({info['price']}): 재료 {info['ingredients']}, 알레르기 정보 {', '.join(info['allergens']) or '없음'}"
+        )
+
+    if not safe_items:
+        return f"'{dietary_preference}' 조건에 맞는 메뉴를 찾지 못했습니다."
+
+    return f"{dietary_preference} 조건에 맞는 메뉴는 다음과 같습니다:\n" + "\n".join(safe_items)
+
+
+@function_tool
 def create_order_ticket(
     context: RestaurantContext, items: str, service_type: str = "매장", notes: str = ""
 ) -> str:
